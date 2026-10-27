@@ -225,7 +225,7 @@ describe("magpie Messages adapter", () => {
 });
 
 describe("magpie quota", () => {
-  it("keeps three balances separate and treats expiresAt as period expiration", () => {
+  it("keeps three balances separate and exposes the confirmed account-period quota reset", () => {
     const result = quotaUsage({
       expiresAt: 1900000000000,
       userQuota: { total: 100, used: 100, remaining: 0 },
@@ -238,14 +238,15 @@ describe("magpie quota", () => {
     expect(result.windows[1]).not.toHaveProperty("used");
     expect(result.windows[1].display).toContain("20 remaining");
     expect(result.windows[2].used).toBe(15);
-    expect(JSON.stringify(result)).not.toContain("resetsAt");
-    expect(result.windows.every((w) => w.display.includes("expires"))).toBe(true);
+    expect(result.windows.every((w) => w.resetsAt === result.until)).toBe(true);
+    expect(result.windows.every((w) => w.display.includes("Quota resets"))).toBe(true);
   });
   it("does not invent zero balances or percentages for a zero total", () => {
     const result = quotaUsage({ userQuota: { total: 0 }, addOnQuota: { remaining: 7 } });
     expect(result.windows[0]).not.toHaveProperty("used");
     expect(result.windows[0]).not.toHaveProperty("amount");
     expect(result).not.toHaveProperty("until");
+    expect(result.windows.every((w) => !("resetsAt" in w))).toBe(true);
   });
   it("uses each account getter's token without a shared quota cache and bounds fetch to 10 seconds", async () => {
     const fetchMock = vi.fn().mockImplementation(async () => Response.json({ userQuota: { remaining: 5 } }));
