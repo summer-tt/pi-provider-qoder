@@ -1,5 +1,6 @@
 import type { OAuthCredentials } from "@earendil-works/pi-ai";
 import { getMachineId, QODER_CLIENT_TYPE, QODER_OPENAPI_COSY_VERSION } from "../cosy.js";
+import { QoderHttpError } from "../protocol/errors.js";
 import { getQoderExchangeURL, getQoderRegionConfig, getQoderUserInfoURL, type QoderMode } from "../region.js";
 
 const UA = "pi-provider-qoder";
@@ -50,7 +51,7 @@ export function decodePatRefresh(refresh: string): {
  *   POST /api/v1/jobToken/exchange { personal_token } -> { token, refresh_token, expires_at }
  * The exchange endpoint does not require a COSY signature.
  */
-export async function exchangeJobToken(pat: string, mode: QoderMode): Promise<PatExchangeResult> {
+export async function exchangeJobToken(pat: string, mode: QoderMode, signal?: AbortSignal): Promise<PatExchangeResult> {
   const res = await fetch(getQoderExchangeURL(mode), {
     method: "POST",
     headers: {
@@ -61,11 +62,15 @@ export async function exchangeJobToken(pat: string, mode: QoderMode): Promise<Pa
       "Cosy-ClientType": QODER_CLIENT_TYPE,
     },
     body: JSON.stringify({ personal_token: pat }),
+    signal,
   });
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`Qoder PAT exchange failed: ${res.status} ${res.statusText}. ${text.slice(0, 200)}`);
+    throw new QoderHttpError(
+      `Qoder PAT exchange failed: ${res.status} ${res.statusText}. ${text.slice(0, 200)}`,
+      res.status,
+    );
   }
 
   const data = (await res.json()) as {
@@ -99,12 +104,15 @@ export async function exchangeJobToken(pat: string, mode: QoderMode): Promise<Pa
 export async function fetchUserInfo(
   jobToken: string,
   mode: QoderMode,
+  signal?: AbortSignal,
+  strict = false,
 ): Promise<{ userID: string; email: string; name: string }> {
   let userID = "";
   let email = "";
   let name = "";
   try {
     const res = await fetch(getQoderUserInfoURL(mode), {
+      signal,
       headers: {
         Authorization: `Bearer ${jobToken}`,
         Accept: "application/json",
@@ -113,6 +121,7 @@ export async function fetchUserInfo(
         "Cosy-ClientType": QODER_CLIENT_TYPE,
       },
     });
+    if (strict && !res.ok) throw new QoderHttpError("Qoder profile request failed", res.status);
     if (res.ok) {
       const info = (await res.json()) as {
         id?: string;
@@ -124,7 +133,10 @@ export async function fetchUserInfo(
       email = info.email || "";
       name = info.name || info.username || "";
     }
-  } catch {}
+  } catch (error) {
+    signal?.throwIfAborted();
+    if (strict) throw error;
+  }
   return { userID, email, name };
 }
 
@@ -133,10 +145,14 @@ export async function fetchUserInfo(
  * Exchanges the PAT for a job token, resolves identity, and encodes the PAT
  * into the refresh field so the token can be re-exchanged on expiry.
  */
-export async function credentialsFromPat(pat: string, mode: QoderMode): Promise<OAuthCredentials> {
+export async function credentialsFromPat(
+  pat: string,
+  mode: QoderMode,
+  signal?: AbortSignal,
+): Promise<OAuthCredentials> {
   const region = getQoderRegionConfig(mode);
-  const { jobToken, jobRefreshToken, expiresAt } = await exchangeJobToken(pat, mode);
-  const { userID, email, name } = await fetchUserInfo(jobToken, mode);
+  const { jobToken, jobRefreshToken, expiresAt } = await exchangeJobToken(pat, mode, signal);
+  const { userID, email, name } = await fetchUserInfo(jobToken, mode, signal);
   const machineID = getMachineId();
 
   return {

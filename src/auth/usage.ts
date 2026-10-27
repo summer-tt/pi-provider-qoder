@@ -1,4 +1,5 @@
 import type { OAuthCredentials } from "@earendil-works/pi-ai";
+import { QoderHttpError } from "../protocol/errors.js";
 import { getQoderRegionConfig, getQoderUsageURL, type QoderMode } from "../region.js";
 
 export interface QoderQuotaBucket {
@@ -87,7 +88,7 @@ export async function fetchQoderUsageForMode(
 
   if (!response.ok) {
     // Do not expose a server-controlled statusText or body in UI errors.
-    throw new Error(`Failed to fetch Qoder usage (${response.status})`);
+    throw new QoderHttpError(`Failed to fetch Qoder usage (${response.status})`, response.status);
   }
 
   const raw = asRecord(await response.json());

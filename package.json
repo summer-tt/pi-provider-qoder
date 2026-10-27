@@ -19,7 +19,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --external:@earendil-works/pi-ai --external:@earendil-works/pi-coding-agent --external:@earendil-works/pi-ai/compat",
+    "build": "node scripts/build.mjs",
     "check": "node node_modules/typescript/bin/tsc --noEmit",
     "lint": "node node_modules/@biomejs/biome/bin/biome check .",
     "lint:fix": "node node_modules/@biomejs/biome/bin/biome check --write .",
@@ -29,7 +29,8 @@
     "test:watch": "vitest",
     "prepare": "npm run build",
     "prepublishOnly": "npm run check && npm run build",
-    "demo:credits": "tsx scripts/demo-credit-footer.ts"
+    "demo:credits": "tsx scripts/demo-credit-footer.ts",
+    "manifest:magpie": "node scripts/magpie-manifest.mjs"
   },
   "pi": {
     "extensions": [

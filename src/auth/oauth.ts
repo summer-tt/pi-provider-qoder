@@ -2,9 +2,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
-import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import { updateQoderModelsCache } from "../catalog.js";
 import { getMachineId } from "../cosy.js";
+import { QoderHttpError } from "../protocol/errors.js";
 import { getQoderRefreshURL, getQoderRegionConfig, type QoderMode } from "../region.js";
 import { interactiveLogin } from "./login.js";
 import { credentialsFromPat, decodePatRefresh, fetchUserInfo, isPatRefresh } from "./pat.js";
@@ -15,17 +15,6 @@ export interface QoderCredentials extends OAuthCredentials {
   name: string;
   machineID: string;
 }
-
-/**
- * `AuthStorage` is not part of every pi-coding-agent release's public exports,
- * so it is read off the module namespace instead of imported by name: a missing
- * export must degrade to the auth-file fallback below, not break the build.
- */
-const AuthStorage = (
-  PiCodingAgent as unknown as {
-    AuthStorage?: { create?: () => { set: (providerID: string, credentials: unknown) => void } };
-  }
-).AuthStorage;
 
 const identityCache = new Map<string, QoderCredentials>();
 
@@ -107,6 +96,9 @@ export async function autoLoginQoderFromEnvironment(providerID: string, mode: Qo
   // account's credentials.
   const credentials = await credentialsFromPat(pat, mode);
 
+  const { AuthStorage } = (await import("@earendil-works/pi-coding-agent")) as unknown as {
+    AuthStorage?: { create?: () => { set: (providerID: string, credentials: unknown) => void } };
+  };
   if (typeof AuthStorage?.create === "function") {
     try {
       const authStorage = AuthStorage.create();
@@ -226,20 +218,25 @@ export async function loginQoderForMode(callbacks: OAuthLoginCallbacks, mode: Qo
 export async function refreshQoderTokenForMode(
   credentials: OAuthCredentials,
   mode: QoderMode,
+  strict = false,
+  options?: { signal?: AbortSignal; cacheModels?: boolean },
 ): Promise<OAuthCredentials> {
   // PAT-based credentials: re-exchange the stored PAT for a fresh job token.
   if (isPatRefresh(credentials.refresh)) {
     const { pat } = decodePatRefresh(credentials.refresh);
     if (pat) {
       try {
-        const refreshed = await credentialsFromPat(pat, mode);
+        const refreshed = await credentialsFromPat(pat, mode, options?.signal);
         const qCreds = refreshed as QoderCredentials;
-        updateQoderModelsCache(qCreds.access, qCreds.userID, qCreds.name, qCreds.email, mode).catch(() => {});
+        if (options?.cacheModels !== false)
+          updateQoderModelsCache(qCreds.access, qCreds.userID, qCreds.name, qCreds.email, mode).catch(() => {});
         return refreshed;
-      } catch {
+      } catch (error) {
+        if (strict) throw error;
         // Fall through to validity extension below.
       }
     }
+    if (strict) throw new Error("Missing Qoder PAT for refresh");
     return {
       ...credentials,
       expires: Date.now() + 60 * 60 * 1000, // extend 1 hour to retry later
@@ -265,6 +262,7 @@ export async function refreshQoderTokenForMode(
         "User-Agent": "pi-provider-qoder",
       },
       body: JSON.stringify({ refreshToken }),
+      signal: options?.signal,
     });
 
     if (response.ok) {
@@ -275,6 +273,7 @@ export async function refreshQoderTokenForMode(
         expires_in?: number;
       };
 
+      if (strict && !data.token) throw new Error("Qoder refresh returned no access token");
       const newAccess = data.token;
       const newRefresh = data.refresh_token || refreshToken;
 
@@ -299,11 +298,15 @@ export async function refreshQoderTokenForMode(
 
       // pi persists the refreshed credentials in auth.json itself.
       // Cache models in background
-      updateQoderModelsCache(newAccess, userID, prevName, prevEmail, mode).catch(() => {});
+      if (options?.cacheModels !== false)
+        updateQoderModelsCache(newAccess, userID, prevName, prevEmail, mode).catch(() => {});
 
       return refreshed;
     }
-  } catch {}
+    if (strict) throw new QoderHttpError(`Qoder refresh failed (${response.status})`, response.status);
+  } catch (error) {
+    if (strict) throw error;
+  }
 
   // Fallback: Extend validity slightly to buy time, as Qoder tokens are long-lived
   const refreshedFallback = {

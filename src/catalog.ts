@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import type { ThinkingLevel, ThinkingLevelMap } from "@earendil-works/pi-ai";
 import { buildAuthHeaders } from "./cosy.js";
 import { refreshGatewayCosyVersion } from "./cosy-version.js";
+import { QoderHttpError } from "./protocol/errors.js";
 import { getQoderBaseUrl, getQoderModelListURL, getQoderRegionConfig, type QoderMode } from "./region.js";
 
 export const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
@@ -640,7 +641,7 @@ export function contextWindowFromCatalog(entry: QoderModelEntry): number {
 }
 
 /** Prefer the largest context option when Qoder exposes selectable contexts. */
-function withMaxContextAsDefault(entry: QoderModelEntry): QoderModelEntry {
+export function withMaxContextAsDefault(entry: QoderModelEntry): QoderModelEntry {
   const contextConfig = entry.context_config;
   if (!contextConfig || typeof contextConfig !== "object") return entry;
 
@@ -667,6 +668,100 @@ export function isCacheStale(mode: QoderMode): boolean {
   return Date.now() - data.updatedAt > 3600_000;
 }
 
+export async function fetchQoderCatalog(
+  authToken: string,
+  userID: string,
+  name: string,
+  email: string,
+  mode: QoderMode,
+  signal?: AbortSignal,
+): Promise<QoderCatalog> {
+  const modelListURL = getQoderModelListURL(mode);
+  // Refresh the dynamic COSY identity BEFORE signing this request: the
+  // gateway gates the catalog on the client's COSY version, so a catalog
+  // request signed with a stale identity returns the reduced list, which
+  // is then cached for its full TTL and registered for the whole session.
+  // The refresh is throttled to once a day and never throws; when it is
+  // not due it returns immediately.
+  await refreshGatewayCosyVersion();
+
+  const headers = buildAuthHeaders(null, modelListURL, {
+    userID,
+    authToken,
+    name,
+    email,
+  });
+
+  const response = await fetch(modelListURL, {
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+      ...headers,
+    },
+    signal,
+  });
+
+  if (!response.ok) throw new QoderHttpError("Qoder model catalog request failed", response.status);
+
+  return parseQoderCatalog(await response.json(), mode);
+}
+
+export interface QoderCatalog {
+  models: QoderModelDef[];
+  configs: Record<string, QoderModelEntry>;
+}
+
+/** Parse one account's catalog without reading or writing the Pi cache. */
+export function parseQoderCatalog(value: unknown, mode: QoderMode): QoderCatalog {
+  const chatModels = (value as { chat?: QoderModelEntry[] })?.chat;
+  if (!Array.isArray(chatModels) || chatModels.length === 0) throw new Error("Empty Qoder model catalog");
+  const newModels: QoderModelDef[] = [];
+  const configs: Record<string, QoderModelEntry> = {};
+
+  for (const entry of chatModels) {
+    const key = entry.key;
+    if (!key || !entry.enable || !entry.display_name) continue;
+
+    const display = entry.display_name;
+    // Prefer the largest selectable context option the catalog advertises
+    // (e.g. 1M when 200K/400K/1M are offered). If none is advertised, use
+    // DEFAULT_CONTEXT_WINDOW rather than the stale 180K `max_input_tokens`
+    // floor. Do not seed from DEFAULT_CONTEXT_WINDOW before scanning
+    // context_config: that would inflate models that only advertise 200K.
+    const ctxLen = contextWindowFromCatalog(entry);
+    const isVL = !!entry.is_vl;
+    const isReasoning = !!entry.is_reasoning || !!entry.thinking_config;
+    const supportsEffort = !!entry.thinking_config?.enabled?.efforts;
+    const thinkingLevelMap = buildThinkingLevelMap(entry);
+    const thinking = buildThinkingConfig(entry);
+    // Both regions expose display_name (whitespace-stripped) as the sole
+    // pi-visible id. The config stores the upstream key under that id for
+    // request-time use.
+    const modelInfo = { id: toQoderModelId(display), name: display };
+
+    configs[modelInfo.id] = entry;
+
+    newModels.push({
+      id: modelInfo.id,
+      name: modelInfo.name,
+      api: "qoder-api",
+      provider: getQoderRegionConfig(mode).providerID,
+      baseUrl: getQoderBaseUrl(mode),
+      reasoning: isReasoning,
+      supportsEffort,
+      thinkingLevelMap,
+      thinking,
+      input: isVL ? ["text", "image"] : ["text"],
+      cost: ZERO_COST,
+      contextWindow: ctxLen,
+      maxTokens: MAX_OUTPUT_TOKENS,
+    });
+  }
+
+  if (newModels.length === 0) throw new Error("Empty Qoder model catalog");
+  return { models: newModels, configs };
+}
+
 export async function updateQoderModelsCache(
   authToken: string,
   userID: string,
@@ -674,90 +769,8 @@ export async function updateQoderModelsCache(
   email: string,
   mode: QoderMode,
 ): Promise<void> {
-  const modelListURL = getQoderModelListURL(mode);
   try {
-    // Refresh the dynamic COSY identity BEFORE signing this request: the
-    // gateway gates the catalog on the client's COSY version, so a catalog
-    // request signed with a stale identity returns the reduced list, which
-    // is then cached for its full TTL and registered for the whole session.
-    // The refresh is throttled to once a day and never throws; when it is
-    // not due it returns immediately.
-    await refreshGatewayCosyVersion();
-
-    const headers = buildAuthHeaders(null, modelListURL, {
-      userID,
-      authToken,
-      name,
-      email,
-    });
-
-    const response = await fetch(modelListURL, {
-      method: "GET",
-      headers: {
-        Accept: "application/json",
-        ...headers,
-      },
-    });
-
-    if (!response.ok) {
-      return;
-    }
-
-    const resData = (await response.json()) as { chat?: QoderModelEntry[] };
-    const chatModels = resData.chat || [];
-    if (chatModels.length === 0) return;
-
-    const newModels: QoderModelDef[] = [];
-    const configs: Record<string, QoderModelEntry> = {};
-
-    for (const entry of chatModels) {
-      const key = entry.key;
-      if (!key || !entry.enable || !entry.display_name) continue;
-
-      const display = entry.display_name;
-      // Prefer the largest selectable context option the catalog advertises
-      // (e.g. 1M when 200K/400K/1M are offered). If none is advertised, use
-      // DEFAULT_CONTEXT_WINDOW rather than the stale 180K `max_input_tokens`
-      // floor. Do not seed from DEFAULT_CONTEXT_WINDOW before scanning
-      // context_config: that would inflate models that only advertise 200K.
-      const ctxLen = contextWindowFromCatalog(entry);
-      const isVL = !!entry.is_vl;
-      const isReasoning = !!entry.is_reasoning || !!entry.thinking_config;
-      const supportsEffort = !!entry.thinking_config?.enabled?.efforts;
-      const thinkingLevelMap = buildThinkingLevelMap(entry);
-      const thinking = buildThinkingConfig(entry);
-      // Both regions expose display_name (whitespace-stripped) as the sole
-      // pi-visible id. The config stores the upstream key under that id for
-      // request-time use.
-      const modelInfo = { id: toQoderModelId(display), name: display };
-
-      configs[modelInfo.id] = entry;
-
-      newModels.push({
-        id: modelInfo.id,
-        name: modelInfo.name,
-        api: "qoder-api",
-        provider: getQoderRegionConfig(mode).providerID,
-        baseUrl: getQoderBaseUrl(mode),
-        reasoning: isReasoning,
-        supportsEffort,
-        thinkingLevelMap,
-        thinking,
-        input: isVL ? ["text", "image"] : ["text"],
-        cost: ZERO_COST,
-        contextWindow: ctxLen,
-        maxTokens: MAX_OUTPUT_TOKENS,
-      });
-    }
-
-    if (newModels.length === 0) return;
-
-    const cacheData = {
-      updatedAt: Date.now(),
-      models: newModels,
-      configs,
-    };
-
-    writeParsedModelCache(mode, cacheData);
+    const catalog = await fetchQoderCatalog(authToken, userID, name, email, mode);
+    writeParsedModelCache(mode, { updatedAt: Date.now(), ...catalog });
   } catch {}
 }

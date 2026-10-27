@@ -19,6 +19,93 @@ Inside pi:
 /model Qwen3.8-Max
 ```
 
+## magpie / OpenCode package
+
+magpie uses a separate OpenCode plugin entry point. In the web UI, open **Plugins →
+Installed**, remove `github:summer-tt/pi-provider-qoder#install` if installed, then
+add:
+
+```text
+github:summer-tt/pi-provider-qoder#install-magpie
+```
+
+For updates, use **Check for updates**, then this plugin's **Update** action.
+The `install-magpie` branch must be published before this source change can be
+installed that way. `#install` remains the Pi package; `#install-magpie` contains
+prebuilt `dist/magpie.js` and a manifest without Pi resource markers or a
+coding-agent dependency. It works when installation scripts are disabled.
+Both distributions keep the package name `pi-provider-qoder`.
+
+Removing the plugin in magpie preserves the `qoder` / `qoder-cn` accounts in
+magpie's `plugin-auth.json`. Replacing the branch retains those credentials and
+allows magpie to restore model picks for the same package name. The plugin uses
+magpie's account getter and credential writer; it does not migrate credentials
+from Pi's auth file. New accounts can use browser OAuth for global Qoder, or a PAT
+for either region. Environment PAT auto-login described below belongs to the Pi
+entry point; magpie asks for the token in its sign-in form.
+
+The OpenCode entry point serves Anthropic Messages, including text, thinking,
+base64 images, tool calls and tool results, with streaming and nonstreaming
+responses. Tool arguments are emitted after Qoder validates the complete JSON.
+Unsupported content and forced tool-choice modes return an error rather than
+silently dropping conversation data. `tool_choice: none` clears the tools sent
+upstream, and failed tool results retain an explicit error marker. Thinking
+budgets map to effort levels, while model variants expose the levels the
+account's catalog supports. A length-limited tool response retains `max_tokens`.
+
+The catalog and request configuration are kept together in memory for each
+account; one account's refresh cannot replace another's model definitions.
+magpie does not read or update Pi's model catalog files. PAT sign-ins and token
+refreshes expose a real user ID as `uid`; shared placeholder profile emails are
+omitted so different accounts are not merged.
+
+Before any content is emitted, upstream failures retain their HTTP status
+(including 400, 401, 429 and server errors). Failures after content starts use a
+classified SSE error, without a successful terminal event. Arbitrary server
+error bodies are not forwarded, and current credential values are redacted from
+public errors. Cancelling a request or its response body cancels the upstream
+stream; request cancellation also covers identity and token refresh preparation.
+The adapter still consumes Qoder events eagerly, so a slow consumer can cause
+response buffering; it does not provide end-to-end backpressure.
+
+magpie shows personal quota, add-on credits and organization resources separately,
+including each reported remaining balance. Missing counters stay unknown;
+percentages require a positive total and a known used amount. All three windows
+are informational (`aside`) so an empty personal quota does not disable an account
+that can still spend add-on credits. Usage requests have a 10-second deadline covering credential preparation and
+the quota request, and use the selected account's credentials without a shared
+quota cache.
+`expiresAt` means **account-period expiration**, shown as `until` and in each
+quota description. It is not a confirmed renewal or quota reset time.
+
+### Rebuilding installation branches
+
+Maintainers publish the two installation branches separately from source `main`.
+After updating `main`, rebuild `#install` with the existing Pi manifest, remove its
+`prepare` hook, and commit the current `dist/index.js` on that distribution branch.
+
+For `#install-magpie`, start a separate distribution checkout at the same source
+commit, then generate the package manifest and current artifact:
+
+```bash
+npm ci --ignore-scripts
+npm run check && npm run lint && npm test && npm run build
+# build writes dist/index.js, dist/magpie.js and dist/magpie-package.json
+cp dist/magpie-package.json package.json
+npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+npm install --omit=dev --ignore-scripts --no-audit --no-fund
+node -e 'import("./dist/magpie.js").then(m => console.log(Object.keys(m)))'
+```
+
+The manifest can also be generated at a specified path with
+`node scripts/magpie-manifest.mjs /path/to/package.json` while the source manifest
+is still present. On `install-magpie`, commit the generated root `package.json`,
+its matching lockfile and the rebuilt `dist/magpie.js`; do not copy the Pi entry
+point or source `src/index.ts` into the delivered package. Publish that distribution
+commit to `install-magpie` using `git push --force-with-lease origin install-magpie`.
+Repeat this process after every source update, so the artifact and manifest match
+the new source commit. Neither distribution commit belongs on source `main`.
+
 ## Providers
 
 Both providers register together.
