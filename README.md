@@ -75,8 +75,10 @@ are informational (`aside`) so an empty personal quota does not disable an accou
 that can still spend add-on credits. Usage requests have a 10-second deadline covering credential preparation and
 the quota request, and use the selected account's credentials without a shared
 quota cache.
-`expiresAt` means **account-period expiration**, shown as `until` and in each
-quota description. It is not a confirmed renewal or quota reset time.
+`expiresAt` marks both **account-period expiration and quota reset**, as confirmed
+by the account owner. It is shown as `until` and as each quota window's `resetsAt`,
+with a reset-time description. When it is absent or invalid, no reset time is
+invented.
 
 ### Rebuilding installation branches
 

@@ -27,13 +27,14 @@ export function quotaUsage(raw: unknown) {
         : `${bucket.remaining}${bucket.unit ? ` ${bucket.unit}` : ""} remaining`,
       amount === undefined ? undefined : `${amount} used`,
       bucket.total === undefined ? undefined : `total ${bucket.total}`,
-      until ? `Account period expires ${until}; renewal time unknown` : undefined,
+      until ? `Quota resets ${until}` : undefined,
     ]
       .filter(Boolean)
       .join("; ");
     return [
       {
         name,
+        ...(until ? { resetsAt: until } : {}),
         ...(used === undefined ? {} : { used }),
         ...(amount === undefined ? {} : { amount }),
         ...(bucket.total === undefined ? {} : { limit: bucket.total }),
