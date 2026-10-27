@@ -15,13 +15,14 @@ import {
   type ToolCall,
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
-import { resolveQoderIdentity } from "../auth/oauth.js";
-import { getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
+import { type QoderCredentials, resolveQoderIdentity } from "../auth/oauth.js";
+import { getCachedModelConfig, MAX_OUTPUT_TOKENS, type QoderModelEntry } from "../catalog.js";
 import { buildAuthHeaders, getMachineId } from "../cosy.js";
 import { applyQoderCredits } from "../credits.js";
 import { getAccountChatBaseUrl, rememberChatBaseUrl, rotateChatEndpoint } from "../endpoints.js";
 import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { qoderEncodeBody } from "./encoding.js";
+import { QoderHttpError } from "./errors.js";
 import { isDegenerateDsmlTurn, stripDsmlResidue, stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { transformMessagesForQoder, transformTools } from "./transform.js";
 
@@ -503,14 +504,30 @@ export function resolveRequestContext(
   return { messages, systemText, tools };
 }
 
+export interface QoderStreamOverrides {
+  modelConfig?: QoderModelEntry;
+  stableEvents?: boolean;
+  structuredErrors?: boolean;
+}
+
 export function streamQoder(
   model: Model<Api>,
   context: Context,
   options?: SimpleStreamOptions,
+  credentials?: QoderCredentials,
+  overrides?: QoderStreamOverrides,
 ): AssistantMessageEventStream {
   const StreamCtor = (PiAi as unknown as { AssistantMessageEventStream: new () => AssistantMessageEventStream })
     .AssistantMessageEventStream;
   const stream = new StreamCtor();
+  if (overrides?.stableEvents) {
+    const push = stream.push.bind(stream);
+    stream.push = (event) => {
+      // ThinkingTagParser may splice content before queued events are consumed.
+      if ("contentIndex" in event) Object.assign(event, { qoderBlock: event.partial.content[event.contentIndex] });
+      push(event);
+    };
+  }
 
   const output: AssistantMessage = {
     role: "assistant",
@@ -552,7 +569,7 @@ export function streamQoder(
       // credentials in its own agent.db, not in ~/.pi/agent/auth.json, so a
       // cache miss would otherwise send uid "qoder-user" and Qoder CN rejects
       // it with "Login expired" (105).
-      const ident = await resolveQoderIdentity(accessToken, model.provider, providerMode);
+      const ident = credentials ?? (await resolveQoderIdentity(accessToken, model.provider, providerMode));
       const userID = ident.userID || "qoder-user";
       const name = ident.name || region.userNameFallback;
       const email = ident.email || region.userEmailFallback;
@@ -561,7 +578,7 @@ export function streamQoder(
       // Both providers expose the upstream display_name (whitespace stripped)
       // as the pi id. Read the original key from cached/static config so the
       // gateway still receives identifiers such as `lite` or `qmodel`.
-      const modelConfig = getCachedModelConfig(model.id, providerMode);
+      const modelConfig = overrides?.modelConfig ?? getCachedModelConfig(model.id, providerMode);
       if (!modelConfig?.key) {
         throw new Error(`Unknown Qoder model id: ${model.id}`);
       }
@@ -827,6 +844,7 @@ export function streamQoder(
             // seen yet and the retry is safe.
             throw new QoderDailyChatLimitError(`Upstream status ${response.status}: ${errText}`, false);
           }
+          if (overrides?.structuredErrors) throw new QoderHttpError("Qoder chat request failed", response.status);
           throw new Error(`Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`);
         }
 
@@ -919,6 +937,8 @@ export function streamQoder(
                       sawModelOutput,
                     );
                   }
+                  if (overrides?.structuredErrors)
+                    throw new QoderHttpError("Qoder upstream request failed", envelope.statusCodeValue);
                   throw new Error(`Upstream status ${envelope.statusCodeValue}: ${envelope.body}`);
                 }
 
@@ -1387,6 +1407,7 @@ export function streamQoder(
       // Cancellation outranks recovery: an aborted turn keeps `aborted`, never a
       // retry-classified server error for a turn the user cancelled.
       output.stopReason = aborted ? "aborted" : "error";
+      if (overrides?.structuredErrors) Object.assign(output, { qoderError: e });
       output.errorMessage = e instanceof Error ? e.message : String(e);
       stream.push({ type: "error", reason: output.stopReason, error: output });
       try {
