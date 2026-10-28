@@ -1,10 +1,12 @@
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { QoderCredentials } from "../auth/oauth.js";
+import * as OAuth from "../auth/oauth.js";
 import { parseQoderCatalog } from "../catalog.js";
 import * as CosyVersion from "../cosy-version.js";
+import { clearQoderEndpointsCache, getCachedChatBaseUrl } from "../endpoints.js";
 import { QoderCNPlugin, QoderPlugin } from "../magpie/index.js";
 import { messagesResponse } from "../magpie/messages.js";
 import { streamQoder } from "../protocol/stream.js";
@@ -545,5 +547,160 @@ describe("magpie credential cancellation and usage deadline", () => {
     await vi.advanceTimersByTimeAsync(10_000);
     await result;
     expect(identitySignal?.aborted).toBe(true);
+  });
+});
+
+describe("magpie daily limit routing", () => {
+  const limit = { code: "110", message: "Billing daily count exceeded" };
+  const endpointCredentials = (account: typeof auth) => ({ userID: account.userID, authToken: account.access });
+  beforeEach(() => clearQoderEndpointsCache());
+  afterEach(() => clearQoderEndpointsCache());
+
+  it.each(["http", "sse"])("rotates %s 110 before structured error handling", async (transport) => {
+    const routes: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.includes("/model/list")) return Response.json(catalog);
+        if (url.includes("region/endpoints"))
+          return Response.json({ dataNodeMap: { remote_agent: ["https://recovered.example/"] } });
+        routes.push(url);
+        if (!url.startsWith("https://recovered.example/"))
+          return transport === "http" ? Response.json(limit, { status: 403 }) : new Response(envelope(limit, 403));
+        return new Response(chunk({ content: "recovered" }, "stop") + done);
+      }),
+    );
+    const loader = await (await QoderPlugin({ client })).auth.loader(async () => auth);
+    const response = await loader.fetch(request({ stream: false }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ content: [{ type: "text", text: "recovered" }] });
+    expect(routes).toHaveLength(2);
+    expect(getCachedChatBaseUrl("global", endpointCredentials(auth))).toBe("https://recovered.example/");
+  });
+
+  it.each([false, true].flatMap((stream) => ["http", "sse"].map((transport) => ({ stream, transport }))))(
+    "maps exhausted $transport 110 to HTTP 403 (stream=$stream)",
+    async ({ stream, transport }) => {
+      const routes: string[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: string | URL | Request) => {
+          const url = String(input);
+          if (url.includes("/model/list")) return Response.json(catalog);
+          if (url.includes("region/endpoints"))
+            return Response.json({ dataNodeMap: { remote_agent: ["https://exhausted.example/"] } });
+          routes.push(url);
+          return transport === "http" ? Response.json(limit, { status: 403 }) : new Response(envelope(limit, 403));
+        }),
+      );
+      const loader = await (await QoderPlugin({ client })).auth.loader(async () => auth);
+      const response = await loader.fetch(request({ stream }));
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({
+        type: "error",
+        error: { type: "permission_error", message: "Qoder permission denied" },
+      });
+      expect(routes).toHaveLength(2);
+      expect(getCachedChatBaseUrl("global", endpointCredentials(auth))).toBeUndefined();
+    },
+  );
+
+  it("keeps concurrent accounts' routes, catalogs and successful nodes separate and bypasses auth.json", async () => {
+    // A matching token in Pi's auth file must never override explicit Magpie identity.
+    writeFileSync(
+      join(process.env.HOME as string, ".pi/agent/auth.json"),
+      JSON.stringify({ qoder: { ...auth, userID: "wrong-pi-account" } }),
+    );
+    OAuth.clearQoderAuthMemCache();
+    const resolveIdentity = vi.spyOn(OAuth, "resolveQoderIdentity");
+    let reachedA!: () => void;
+    let releaseA!: () => void;
+    const waitingA = new Promise<void>((resolve) => {
+      reachedA = resolve;
+    });
+    const pausedA = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    const routes: { uid: string; url: string; key: string }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        const uid = new Headers(init?.headers).get("Cosy-User") as string;
+        expect([auth.userID, second.userID]).toContain(uid);
+        if (url.includes("/model/list")) return Response.json({ chat: [{ ...auto, key: uid }] });
+        if (url.includes("region/endpoints"))
+          return Response.json({ dataNodeMap: { remote_agent: [`https://${uid.toLowerCase()}.example/`] } });
+        routes.push({ uid, url, key: decode(init as RequestInit).model_config.key });
+        if (url.startsWith("https://api3.qoder.sh/")) return new Response(envelope(limit, 403));
+        expect(url).toContain(`${uid.toLowerCase()}.example/`);
+        if (uid === auth.userID) {
+          reachedA();
+          await pausedA;
+        }
+        return new Response(chunk({ content: uid }, "stop") + done);
+      }),
+    );
+    const plugin = await QoderPlugin({ client });
+    const loaderA = await plugin.auth.loader(async () => auth);
+    const loaderB = await plugin.auth.loader(async () => second);
+    const responseA = loaderA.fetch(request({ stream: false }));
+    try {
+      await waitingA;
+      const responseB = await loaderB.fetch(request({ stream: false }));
+      expect(responseB.status).toBe(200);
+      expect(await responseB.json()).toMatchObject({ content: [{ text: second.userID }] });
+    } finally {
+      releaseA();
+    }
+    const completedA = await responseA;
+    expect(completedA.status).toBe(200);
+    expect(await completedA.json()).toMatchObject({ content: [{ text: auth.userID }] });
+    expect(routes).toHaveLength(4);
+    expect(routes.every(({ uid, key }) => uid === key)).toBe(true);
+    for (const account of [auth, second])
+      expect(getCachedChatBaseUrl("global", endpointCredentials(account))).toBe(
+        `https://${account.userID.toLowerCase()}.example/`,
+      );
+    expect(resolveIdentity).not.toHaveBeenCalled();
+  });
+
+  it("passes caller cancellation into discovery and stops rotation", async () => {
+    const controller = new AbortController();
+    const chats: string[] = [];
+    let discoverySignal: AbortSignal | null | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes("/model/list")) return Response.json(catalog);
+        if (url.includes("region/endpoints")) {
+          discoverySignal = init?.signal;
+          controller.abort();
+          return new Promise<Response>(() => {});
+        }
+        chats.push(url);
+        return new Response(envelope(limit, 403));
+      }),
+    );
+    const loader = await (await QoderPlugin({ client })).auth.loader(async () => auth);
+    const response = await loader.fetch(request({ stream: false }, controller.signal));
+    expect(response.status).toBe(499);
+    expect(discoverySignal?.aborted).toBe(true);
+    expect(chats).toHaveLength(1);
+    expect(getCachedChatBaseUrl("global", endpointCredentials(auth))).toBeUndefined();
+  });
+
+  it("does not rotate or retry 110 after output through the Magpie entry", async () => {
+    const { fetchMock } = mockChat(() => new Response(chunk({ content: "visible" }) + envelope(limit, 403)));
+    const loader = await (await QoderPlugin({ client })).auth.loader(async () => auth);
+    const response = await loader.fetch(request({ stream: true }));
+    expect(response.status).toBe(200);
+    const events = sse(await response.text());
+    expect(JSON.stringify(events)).toContain("visible");
+    expect(events.at(-1)).toMatchObject({ type: "error", error: { type: "permission_error" } });
+    expect(events.some((event) => event.type === "message_stop")).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(2); // catalog and one chat; no discovery
   });
 });
