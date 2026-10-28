@@ -27,7 +27,6 @@
     "test": "vitest run",
     "test:live": "tsx scripts/record-live-fixtures.ts",
     "test:watch": "vitest",
-    "prepare": "npm run build",
     "prepublishOnly": "npm run check && npm run build",
     "demo:credits": "tsx scripts/demo-credit-footer.ts"
   },
