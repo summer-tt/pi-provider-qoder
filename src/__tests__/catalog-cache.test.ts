@@ -224,6 +224,27 @@ describe("Qoder model cache", () => {
     expect(getCachedModels("global").map((model) => model.id)).toEqual(["Auto", "Lite"]);
   });
 
+  it("persists both thinking metadata contracts for an enabled Auto catalog", async () => {
+    const entry = {
+      key: "auto",
+      enable: true,
+      display_name: "Auto",
+      thinking_config: { disabled: {}, enabled: { efforts: { low: {}, high: { is_default: true } } } },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ chat: [entry] })),
+    );
+    await updateQoderModelsCache("access-token", "user-id", "Test User", "test@example.com", "global");
+    clearQoderModelsMemCache();
+    expect(getCachedModels("global")[0]).toMatchObject({
+      id: "Auto",
+      thinkingLevelMap: { off: "disabled", low: "low", high: "high" },
+      thinking: { mode: "effort", efforts: ["low", "high"], defaultLevel: "high", requiresEffort: false },
+    });
+    expect(getCachedModelConfig("Auto", "global")?.key).toBe("auto");
+  });
+
   it("records a 1M context window when the catalog omits context_config", async () => {
     vi.stubGlobal(
       "fetch",

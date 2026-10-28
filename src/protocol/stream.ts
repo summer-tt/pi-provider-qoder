@@ -21,7 +21,7 @@ import { buildAuthHeaders, getMachineId } from "../cosy.js";
 import { applyQoderCredits } from "../credits.js";
 import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { qoderEncodeBody } from "./encoding.js";
-import { QoderHttpError } from "./errors.js";
+import { QoderHttpError, QoderQueuedError } from "./errors.js";
 import { isDegenerateDsmlTurn, stripDsmlResidue, stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { transformMessagesForQoder, transformTools } from "./transform.js";
 
@@ -34,7 +34,7 @@ import { transformMessagesForQoder, transformTools } from "./transform.js";
  * A real queue (`isQueued:true`) is NOT retried in-line: the wait can be
  * minutes, and sleeping inside the stream would block the turn under the
  * host's abort and retry policy. Instead the queued rejection is surfaced
- * as a host-schedulable error carrying the queue fields and a
+ * as a retryable error carrying the queue fields and a
  * `retry-after-ms=` hint, with no bare `403` in the text (a bare 403 is
  * classified as an auth failure by the host and never retried).
  */
@@ -95,7 +95,7 @@ function parseJsonObject(value: unknown, depth = 0): Record<string, unknown> | u
  *   this request's slot) over `retryAfterSeconds` (a minimum re-ask
  *   interval); re-asking at the shorter interval would land at the back
  *   of the queue. The stream loop does NOT sleep on this — it surfaces
- *   a host-schedulable error instead.
+ *   a retryable error instead.
  * - Missing flags or any other code: not a busy signal, keep the
  *   previous failure behavior.
  */
@@ -123,22 +123,9 @@ export function parseModelBusyRejection(body: unknown): ModelBusyQueueSnapshot |
   return undefined;
 }
 
-/**
- * Format a queued rejection for the host's retry machinery. The text
- * deliberately contains no bare `403` (hosts classify that as an auth
- * failure and never retry), includes a `retry-after-ms=` hint the host
- * can schedule on, and stays retryable under pi-ai's retryable pattern
- * via the truthful "rate limit" token (the queue is a CALL_COUNT_LIMIT
- * throttle). Queue fields are included so a queued failure is
- * distinguishable from an auth failure in logs and transcripts.
- */
-export function formatQueuedBusyError(snapshot: Extract<ModelBusyQueueSnapshot, { kind: "queued" }>): Error {
-  const waitSeconds = Math.round(snapshot.waitMs / 1000);
-  const ahead = snapshot.queueCount !== undefined ? `, ${snapshot.queueCount} ahead` : "";
-  const tier = snapshot.queueType ? ` (${snapshot.queueType})` : "";
-  return new Error(
-    `Qoder model is busy: request queued (10605 CALL_COUNT_LIMIT${tier}${ahead}, ~${waitSeconds}s wait, rate limit, retry-after-ms=${snapshot.waitMs})`,
-  );
+/** Keep queue diagnostics retryable without exposing arbitrary upstream text. */
+export function formatQueuedBusyError(snapshot: Extract<ModelBusyQueueSnapshot, { kind: "queued" }>): QoderQueuedError {
+  return new QoderQueuedError(snapshot.waitMs, snapshot.queueCount, snapshot.queueType);
 }
 
 /** Sleep that rejects as soon as the caller aborts. */

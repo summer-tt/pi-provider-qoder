@@ -65,6 +65,18 @@ classified SSE error, without a successful terminal event. Arbitrary server
 error bodies are not forwarded, and current credential values are redacted from
 public errors. Cancelling a request or its response body cancels the upstream
 stream; request cancellation also covers identity and token refresh preparation.
+Queued model rejections before output return HTTP 429 / `rate_limit_error`, with
+validated queue diagnostics in the error message and a `Retry-After` header in
+seconds when a wait is available. Streaming and nonstreaming requests use the
+same error contract. Ready rejections receive bounded local retries; queued
+requests do not sleep inside the adapter. After partial output, neither kind is
+retried locally and the error carries no queue retry hint.
+
+Pi 1.4.0-editor-completion.1 uses its configured exponential retry delay and does
+not consume the `retry-after-ms` message hint. The hint reports the upstream
+wait; it does not guarantee that Pi or magpie waits that duration. Consumer retry
+policy remains responsible for scheduling and cancellation.
+
 The adapter still consumes Qoder events eagerly, so a slow consumer can cause
 response buffering; it does not provide end-to-end backpressure.
 

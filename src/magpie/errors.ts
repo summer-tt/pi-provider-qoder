@@ -1,4 +1,4 @@
-import { QoderHttpError } from "../protocol/errors.js";
+import { QoderHttpError, QoderQueuedError } from "../protocol/errors.js";
 
 export class MessagesInputError extends Error {}
 
@@ -41,7 +41,8 @@ export function publicError(error: unknown, secrets: string[] = [], statusOverri
           : status === 499
             ? "Qoder request cancelled"
             : `Qoder request failed (${status})`;
-  if (error instanceof MessagesInputError) message = error.message;
+  if (error instanceof QoderQueuedError) message = error.message;
+  else if (error instanceof MessagesInputError) message = error.message;
   else if (error instanceof Error && /^Invalid or incomplete tool-call JSON \(characters=\d+\)$/.test(error.message))
     message = error.message;
   for (const secret of secrets.filter(Boolean).sort((a, b) => b.length - a.length))
@@ -51,5 +52,14 @@ export function publicError(error: unknown, secrets: string[] = [], statusOverri
 
 export function errorResponse(error: unknown, status?: number, secrets: string[] = []): Response {
   const result = publicError(error, secrets, status);
-  return Response.json({ type: "error", error: result.error }, { status: result.status });
+  return Response.json(
+    { type: "error", error: result.error },
+    {
+      status: result.status,
+      headers:
+        error instanceof QoderQueuedError && result.status === 429 && error.waitMs > 0
+          ? { "retry-after": String(Math.ceil(error.waitMs / 1000)) }
+          : undefined,
+    },
+  );
 }
