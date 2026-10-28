@@ -8,6 +8,8 @@ import type {
 } from "@earendil-works/pi-ai";
 import { isRetryableAssistantError, retryAssistantCall } from "@earendil-works/pi-ai/utils/retry";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { messagesResponse } from "../magpie/messages.js";
+import { QoderQueuedError } from "../protocol/errors.js";
 import { parseModelBusyRejection, streamQoder } from "../protocol/stream.js";
 
 vi.mock("../auth/oauth.js", () => ({
@@ -246,9 +248,11 @@ describe("streamQoder model-busy recovery", () => {
     vi.restoreAllMocks();
   });
 
-  it("retries a ready rejection and streams the retried reply", async () => {
+  it.each([true, false])("retries a ready rejection with structuredErrors=%s", async (structuredErrors) => {
     globalThis.fetch = mockFetchSequence([busySse({ retryAfterSeconds: 0 }), SUCCESS_SSE]);
-    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    const events = await consume(
+      streamQoder(makeModel(), makeContext(), { apiKey: "fake" }, undefined, { structuredErrors }),
+    );
 
     expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(2);
     expect(doneOf(events).content.find((c) => c.type === "text")).toMatchObject({ text: "pong" });
@@ -379,6 +383,97 @@ describe("streamQoder model-busy recovery", () => {
     expect(isRetryableAssistantError(message)).toBe(true);
   });
 
+  it.each([true, false])("preserves queued diagnostics with structuredErrors=%s", async (structuredErrors) => {
+    globalThis.fetch = mockFetchSequence([
+      busySse({ isQueued: true, waitTime: 367, queueCount: 454, queueType: "p2" }),
+    ]);
+    const message = errorOf(
+      await consume(
+        streamQoder(makeModel(), makeContext(), { apiKey: "fake" }, undefined, {
+          structuredErrors,
+        }),
+      ),
+    );
+    expect(message.errorMessage).toContain("retry-after-ms=367000");
+    expect(isRetryableAssistantError(message)).toBe(true);
+    const detail = (message as AssistantMessage & { qoderError?: unknown }).qoderError;
+    if (structuredErrors) expect(detail).toBeInstanceOf(QoderQueuedError);
+    else expect(detail).toBeUndefined();
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([true, false])("returns Messages queue status and retry header with stream=%s", async (stream) => {
+    globalThis.fetch = mockFetchSequence([busySse({ isQueued: true, waitTime: 3.1, queueCount: 4, queueType: "p2" })]);
+    const abort = new AbortController();
+    const events = streamQoder(makeModel(), makeContext(), { apiKey: "fake", signal: abort.signal }, undefined, {
+      structuredErrors: true,
+      stableEvents: true,
+    });
+    const response = await messagesResponse(events, { model: "Ultimate", messages: [], stream }, abort);
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("4");
+    expect(await response.json()).toMatchObject({
+      type: "error",
+      error: {
+        type: "rate_limit_error",
+        message: expect.stringContaining("retry-after-ms=3100"),
+      },
+    });
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([true, false])("uses a valid fallback after overflowing queue waitTime with stream=%s", async (stream) => {
+    globalThis.fetch = mockFetchSequence([busySse({ isQueued: true, waitTime: 1e300, retryAfterSeconds: 30 })]);
+    const abort = new AbortController();
+    const events = streamQoder(makeModel(), makeContext(), { apiKey: "fake", signal: abort.signal }, undefined, {
+      structuredErrors: true,
+      stableEvents: true,
+    });
+    const response = await messagesResponse(events, { model: "Ultimate", messages: [], stream }, abort);
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("30");
+    expect(await response.json()).toMatchObject({
+      type: "error",
+      error: { type: "rate_limit_error", message: expect.stringContaining("retry-after-ms=30000") },
+    });
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("omits unvalidated queue diagnostics", async () => {
+    globalThis.fetch = mockFetchSequence([
+      busySse({
+        isQueued: true,
+        waitTime: 1e300,
+        retryAfterSeconds: 0,
+        queueCount: -4,
+        queueType: "private body SENSITIVE",
+      }),
+    ]);
+    const message = errorOf(await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" })));
+    expect(message.errorMessage).toContain("retry-after-ms=0");
+    expect(message.errorMessage).not.toMatch(/SENSITIVE|private body|-4 ahead|Infinity/);
+  });
+
+  it.each([true, false])(
+    "does not expose queue retry hints after partial output with structuredErrors=%s",
+    async (structuredErrors) => {
+      globalThis.fetch = mockFetchSequence([
+        envelope(JSON.stringify(chunk({ content: "partial" }))) + busySse({ isQueued: true, waitTime: 367 }),
+      ]);
+      const message = errorOf(
+        await consume(
+          streamQoder(makeModel(), makeContext(), { apiKey: "fake" }, undefined, {
+            structuredErrors,
+          }),
+        ),
+      );
+      expect(message.errorMessage).toContain("after partial output");
+      expect(message.errorMessage).not.toContain("retry-after-ms");
+      expect(isRetryableAssistantError(message)).toBe(false);
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it("keeps the previous behavior when only subCode matches", async () => {
     globalThis.fetch = mockFetchSequence([busySse({ code: "10604" }), SUCCESS_SSE]);
     const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
@@ -504,11 +599,15 @@ describe("streamQoder model-busy recovery", () => {
     expect(errorOf(events).errorMessage).toMatch(/attempts=2/);
   });
 
-  it("aborts while waiting for the retry", async () => {
+  it.each([true, false])("aborts while waiting for the retry with structuredErrors=%s", async (structuredErrors) => {
     vi.useFakeTimers();
     const controller = new AbortController();
     globalThis.fetch = mockFetchSequence([busySse({ retryAfterSeconds: 2 }), SUCCESS_SSE]);
-    const pending = consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake", signal: controller.signal }));
+    const pending = consume(
+      streamQoder(makeModel(), makeContext(), { apiKey: "fake", signal: controller.signal }, undefined, {
+        structuredErrors,
+      }),
+    );
 
     await vi.advanceTimersByTimeAsync(100);
     controller.abort();
