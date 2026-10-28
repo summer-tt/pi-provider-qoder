@@ -1,61 +1,26 @@
 {
   "name": "pi-provider-qoder",
   "version": "0.6.6",
-  "description": "Pi extension for Qoder AI — with OAuth authentication, COSY signatures and WAF bypass",
+  "description": "Qoder and Qoder CN OpenCode plugins for magpie",
   "type": "module",
   "license": "MIT",
-  "publishConfig": {
-    "access": "public"
-  },
-  "keywords": [
-    "pi-package",
-    "pi",
-    "qoder",
-    "ai",
-    "provider"
-  ],
+  "main": "./dist/magpie.js",
+  "exports": "./dist/magpie.js",
   "files": [
-    "dist",
+    "dist/magpie.js",
     "README.md"
   ],
-  "scripts": {
-    "build": "node scripts/build.mjs",
-    "check": "node node_modules/typescript/bin/tsc --noEmit",
-    "lint": "node node_modules/@biomejs/biome/bin/biome check .",
-    "lint:fix": "node node_modules/@biomejs/biome/bin/biome check --write .",
-    "format": "node node_modules/@biomejs/biome/bin/biome format --write .",
-    "test": "vitest run",
-    "test:live": "tsx scripts/record-live-fixtures.ts",
-    "test:watch": "vitest",
-    "prepare": "npm run build",
-    "prepublishOnly": "npm run check && npm run build",
-    "demo:credits": "tsx scripts/demo-credit-footer.ts",
-    "manifest:magpie": "node scripts/magpie-manifest.mjs"
-  },
-  "pi": {
-    "extensions": [
-      "./dist/index.js"
-    ]
-  },
-  "devDependencies": {
-    "@biomejs/biome": "2.5.15",
-    "@earendil-works/pi-ai": "^1.0.4",
-    "@earendil-works/pi-coding-agent": "^1.0.4",
-    "@earendil-works/pi-tui": "^1.0.4",
-    "esbuild": "^0.28.2",
-    "tsx": "^4.23.15",
-    "typescript": "^7.0.2",
-    "vitest": "^5.0.3"
+  "keywords": [
+    "opencode",
+    "magpie",
+    "qoder",
+    "provider"
+  ],
+  "dependencies": {
+    "@earendil-works/pi-ai": "^1.0.4"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/simonsmh/pi-provider-qoder.git"
-  },
-  "bugs": {
-    "url": "https://github.com/simonsmh/pi-provider-qoder/issues"
-  },
-  "homepage": "https://github.com/simonsmh/pi-provider-qoder#readme",
-  "overrides": {
-    "undici": "8.12.2"
   }
 }
