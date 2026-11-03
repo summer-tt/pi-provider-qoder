@@ -19,8 +19,8 @@ import { resolveQoderIdentity } from "../auth/oauth.js";
 import { getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
 import { buildAuthHeaders, getMachineId } from "../cosy.js";
 import { applyQoderCredits } from "../credits.js";
-import { rememberChatBaseUrl, rotateChatEndpoint } from "../endpoints.js";
-import { getQoderChatBaseUrl, getQoderChatURL, getQoderRegionConfig } from "../region.js";
+import { getAccountChatBaseUrl, rememberChatBaseUrl, rotateChatEndpoint } from "../endpoints.js";
+import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { qoderEncodeBody } from "./encoding.js";
 import { isDegenerateDsmlTurn, stripDsmlResidue, stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { transformMessagesForQoder, transformTools } from "./transform.js";
@@ -736,7 +736,9 @@ export function streamQoder(
         },
       };
 
-      let chatURL = getQoderChatURL(providerMode);
+      const endpointCredentials = { userID, authToken: accessToken, name, email, machineID };
+      let chatBase = getAccountChatBaseUrl(providerMode, endpointCredentials);
+      let chatURL = getQoderChatURL(providerMode, chatBase);
       const attemptedChatBases = new Set<string>();
       let switchedChatEndpoint = false;
       let chatEndpointSwitches = 0;
@@ -1275,21 +1277,26 @@ export function streamQoder(
           if (switchedChatEndpoint) {
             // Only persist a node that actually served a request; a node that
             // failed again during rotation is never written.
-            rememberChatBaseUrl(providerMode, getQoderChatBaseUrl(providerMode));
+            rememberChatBaseUrl(providerMode, endpointCredentials, chatBase);
           }
           return;
         } catch (e) {
           if (e instanceof QoderDailyChatLimitError) {
+            options?.signal?.throwIfAborted();
             if (!e.sawModelOutput && chatEndpointSwitches < MAX_CHAT_ENDPOINT_SWITCHES) {
               const nextBase = await rotateChatEndpoint(
                 providerMode,
-                { userID, authToken: accessToken, name, email, machineID },
+                endpointCredentials,
                 attemptedChatBases,
+                chatBase,
+                options?.signal,
               );
               if (nextBase) {
                 chatEndpointSwitches++;
                 switchedChatEndpoint = true;
-                chatURL = getQoderChatURL(providerMode);
+                options?.signal?.throwIfAborted();
+                chatBase = nextBase;
+                chatURL = getQoderChatURL(providerMode, chatBase);
                 headers = buildAuthHeaders(encodedBytes, chatURL, {
                   userID,
                   authToken: accessToken,
