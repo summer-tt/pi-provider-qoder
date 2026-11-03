@@ -17,6 +17,9 @@ afterEach(() => {
     if (value === undefined) delete process.env[name];
     else process.env[name] = value;
   }
+  vi.useRealTimers();
+  vi.doUnmock("../catalog.js");
+  vi.doUnmock("../auth/oauth.js");
   vi.unstubAllGlobals();
   vi.doUnmock("@earendil-works/pi-ai/compat");
   vi.resetModules();
@@ -187,5 +190,44 @@ describe("qoder-api registry", () => {
     expect(providers.get("qoder-cn")?.api).toBe("qoder-api");
     expect(typeof providers.get("qoder")?.streamSimple).toBe("function");
     expect(typeof providers.get("qoder-cn")?.streamSimple).toBe("function");
+  });
+});
+
+describe("startup discovery deadline", () => {
+  it.each(["success", "fetch", "body"])("registers providers with %s discovery and a fresh catalog", async (stage) => {
+    for (const name of patEnvNames) delete process.env[name];
+    vi.doMock("../auth/oauth.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("../auth/oauth.js")>()),
+      autoLoginQoderFromEnvironment: vi.fn(),
+      getCachedCredentials: vi.fn(() => ({ access: "synthetic-token", userID: "startup-user" })),
+    }));
+    vi.doMock("../catalog.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("../catalog.js")>()),
+      isCacheStale: () => false,
+    }));
+    const { default: registerProviders } = await import("../index.js");
+    const { clearQoderEndpointsCache } = await import("../endpoints.js");
+    clearQoderEndpointsCache();
+    const pending = new Promise<never>(() => {});
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        stage === "fetch"
+          ? pending
+          : Promise.resolve(
+              stage === "body"
+                ? { ok: true, text: () => pending }
+                : new Response(JSON.stringify({ dataNodeMap: { remote_agent: ["https://startup.example/"] } })),
+            ),
+      ),
+    );
+    const registerProvider = vi.fn();
+    const result = registerProviders({ registerProvider, on: vi.fn() } as never);
+    await result;
+    expect(registerProvider).toHaveBeenCalledTimes(2);
+    const { getAccountChatBaseUrl } = await import("../endpoints.js");
+    expect(getAccountChatBaseUrl("global", { userID: "startup-user", authToken: "synthetic-token" })).toBe(
+      stage === "success" ? "https://startup.example/" : "https://api3.qoder.sh/",
+    );
   });
 });

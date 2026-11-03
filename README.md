@@ -60,13 +60,18 @@ Agent chat is not bound to the node in this table. At startup the extension asks
 `region/endpoints` for the account's node map and routes chat to the remote-agent node
 (`dataNodeMap.remote_agent`), which is the node Qoder's own CLI uses; the model catalog
 stays on the inference node. The resolved node is cached in
-`~/.pi/agent/qoder-endpoints-cache.json` for one hour.
+`~/.pi/agent/qoder-endpoints-cache.json` for one hour, separately for each account
+and region. Cache keys use a SHA-256 digest of the account user ID (or of the token
+when legacy credentials lack an account ID); plaintext tokens are not stored. Older region-only entries are ignored. Discovery has a
+three-second deadline covering both the connection and response body; failure
+keeps the account's cached route, or the default gateway when no cache exists.
 
 If a chat request is rejected with `403 code 110 "Billing daily count exceeded"`, the
 account has exhausted that node's daily chat allowance — Qoder counts it per node, so
 another node in the map can still serve the same account. The extension then switches to
 the next candidate (remote-agent, then inference, then security), retries, and persists
-whichever node served the request. Discovery failures fall back to the table above.
+whichever node served the request. Each request keeps its own selected node, and
+cancelling a request also cancels discovery and stops endpoint rotation.
 
 ## Request and account Credits
 

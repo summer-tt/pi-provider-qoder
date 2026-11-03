@@ -1,15 +1,10 @@
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildAuthHeaders } from "./cosy.js";
 import { qoderDecodeBody } from "./protocol/encoding.js";
-import {
-  getQoderBaseUrl,
-  getQoderChatBaseUrl,
-  getQoderRegionConfig,
-  type QoderMode,
-  setQoderChatBaseUrl,
-} from "./region.js";
+import { getQoderBaseUrl, getQoderRegionConfig, type QoderMode } from "./region.js";
 
 /**
  * Qoder publishes its node map per account at `region/endpoints`. The response
@@ -42,7 +37,8 @@ export interface QoderEndpointCredentials {
   machineID?: string;
 }
 
-const CACHE_VERSION = 1;
+const CACHE_VERSION = 2;
+export const DISCOVERY_TIMEOUT_MS = 3_000;
 const CACHE_TTL_MS = 60 * 60 * 1000;
 
 interface CacheEntry {
@@ -52,10 +48,22 @@ interface CacheEntry {
 
 interface CacheFile {
   version: number;
-  modes: Record<string, CacheEntry>;
+  accounts: Record<string, CacheEntry>;
 }
 
-const discovered = new Map<QoderMode, { at: number; endpoints: QoderRegionEndpoints }>();
+const selected = new Map<string, string>();
+
+function accountKey(mode: QoderMode, credentials: QoderEndpointCredentials): string {
+  // Legacy credentials can lack an account ID. Never share their fallback
+  // identity across tokens; only the digest is retained in cache keys.
+  const identity =
+    credentials.userID && credentials.userID !== "qoder-user"
+      ? ["user", credentials.userID]
+      : ["token", credentials.authToken];
+  return `${mode}:${createHash("sha256").update(JSON.stringify(identity)).digest("hex")}`;
+}
+
+const discovered = new Map<string, { at: number; endpoints: QoderRegionEndpoints }>();
 
 function getHomeDir(): string {
   return process.env.HOME || process.env.USERPROFILE || homedir();
@@ -136,21 +144,22 @@ export function chatEndpointCandidates(endpoints: QoderRegionEndpoints | undefin
 
 function readCacheFile(): CacheFile {
   const path = getCachePath();
-  if (!existsSync(path)) return { version: CACHE_VERSION, modes: {} };
+  if (!existsSync(path)) return { version: CACHE_VERSION, accounts: {} };
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<CacheFile>;
-    const modes = asRecord(parsed.modes) ?? {};
+    if (parsed.version !== CACHE_VERSION) return { version: CACHE_VERSION, accounts: {} };
+    const accounts = asRecord(parsed.accounts) ?? {};
     const clean: Record<string, CacheEntry> = {};
-    for (const [key, value] of Object.entries(modes)) {
+    for (const [key, value] of Object.entries(accounts)) {
       const entry = asRecord(value);
       if (!entry) continue;
       const chatBaseUrl = typeof entry.chatBaseUrl === "string" ? normalizeBaseUrl(entry.chatBaseUrl) : undefined;
       const updatedAt = typeof entry.updatedAt === "number" ? entry.updatedAt : 0;
       if (chatBaseUrl) clean[key] = { chatBaseUrl, updatedAt };
     }
-    return { version: CACHE_VERSION, modes: clean };
+    return { version: CACHE_VERSION, accounts: clean };
   } catch {
-    return { version: CACHE_VERSION, modes: {} };
+    return { version: CACHE_VERSION, accounts: {} };
   }
 }
 
@@ -165,35 +174,46 @@ function writeCacheFile(file: CacheFile): void {
 }
 
 /** A cached chat node younger than one hour, if any. */
-export function getCachedChatBaseUrl(mode: QoderMode, now = Date.now()): string | undefined {
-  const entry = readCacheFile().modes[mode];
+export function getCachedChatBaseUrl(
+  mode: QoderMode,
+  credentials: QoderEndpointCredentials,
+  now = Date.now(),
+): string | undefined {
+  const entry = readCacheFile().accounts[accountKey(mode, credentials)];
   if (!entry) return undefined;
   if (now - entry.updatedAt > CACHE_TTL_MS) return undefined;
   return entry.chatBaseUrl;
 }
 
 /** Persist the node that just served a request, so the next start skips discovery. */
-export function rememberChatBaseUrl(mode: QoderMode, chatBaseUrl: string, now = Date.now()): void {
+export function rememberChatBaseUrl(
+  mode: QoderMode,
+  credentials: QoderEndpointCredentials,
+  chatBaseUrl: string,
+  now = Date.now(),
+): void {
   const normalized = normalizeBaseUrl(chatBaseUrl);
   if (!normalized) return;
   const file = readCacheFile();
-  file.modes[mode] = { chatBaseUrl: normalized, updatedAt: now };
+  file.accounts[accountKey(mode, credentials)] = { chatBaseUrl: normalized, updatedAt: now };
+  selected.set(accountKey(mode, credentials), normalized);
   writeCacheFile(file);
 }
 
 /** Apply the persisted chat node for this start, if it is still fresh. */
-export function applyCachedChatEndpoint(mode: QoderMode): string | undefined {
-  const cached = getCachedChatBaseUrl(mode);
+export function applyCachedChatEndpoint(mode: QoderMode, credentials: QoderEndpointCredentials): string | undefined {
+  const cached = getCachedChatBaseUrl(mode, credentials);
   if (!cached) return undefined;
-  setQoderChatBaseUrl(mode, cached);
+  selected.set(accountKey(mode, credentials), cached);
   return cached;
 }
 
 export function clearQoderEndpointsCache(): void {
   discovered.clear();
+  selected.clear();
   try {
     const path = getCachePath();
-    if (existsSync(path)) writeFileSync(path, JSON.stringify({ version: CACHE_VERSION, modes: {} }), "utf8");
+    if (existsSync(path)) writeFileSync(path, JSON.stringify({ version: CACHE_VERSION, accounts: {} }), "utf8");
   } catch {
     // Ignore: tests and read-only environments.
   }
@@ -206,7 +226,16 @@ function getRegionEndpointsURL(mode: QoderMode): string {
 export async function fetchQoderRegionEndpoints(
   mode: QoderMode,
   credentials: QoderEndpointCredentials,
+  signal?: AbortSignal,
 ): Promise<QoderRegionEndpoints | undefined> {
+  signal?.throwIfAborted();
+  const controller = new AbortController();
+  const abort = () => controller.abort(signal?.reason);
+  signal?.addEventListener("abort", abort, { once: true });
+  const timer = setTimeout(() => controller.abort(new Error("Qoder discovery timed out")), DISCOVERY_TIMEOUT_MS);
+  const interrupted = new Promise<never>((_, reject) => {
+    controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true });
+  });
   const url = getRegionEndpointsURL(mode);
   try {
     const headers = buildAuthHeaders(null, url, {
@@ -216,12 +245,16 @@ export async function fetchQoderRegionEndpoints(
       email: credentials.email ?? "",
       machineID: credentials.machineID,
     });
-    const response = await fetch(url, {
-      method: "GET",
-      headers: { Accept: "application/json", ...headers },
-    });
+    const response = await Promise.race([
+      fetch(url, {
+        signal: controller.signal,
+        method: "GET",
+        headers: { Accept: "application/json", ...headers },
+      }),
+      interrupted,
+    ]);
     if (!response.ok) return undefined;
-    const text = await response.text();
+    const text = await Promise.race([response.text(), interrupted]);
     let payload: unknown;
     try {
       payload = JSON.parse(text);
@@ -230,19 +263,26 @@ export async function fetchQoderRegionEndpoints(
     }
     return parseQoderRegionEndpoints(payload);
   } catch {
+    signal?.throwIfAborted();
     return undefined;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
   }
 }
 
 async function getRegionEndpoints(
   mode: QoderMode,
   credentials: QoderEndpointCredentials,
+  signal?: AbortSignal,
 ): Promise<QoderRegionEndpoints | undefined> {
-  const cached = discovered.get(mode);
+  signal?.throwIfAborted();
+  const key = accountKey(mode, credentials);
+  const cached = discovered.get(key);
   if (cached && Date.now() - cached.at <= CACHE_TTL_MS) return cached.endpoints;
-  const endpoints = await fetchQoderRegionEndpoints(mode, credentials);
+  const endpoints = await fetchQoderRegionEndpoints(mode, credentials, signal);
   if (!endpoints) return cached?.endpoints;
-  discovered.set(mode, { at: Date.now(), endpoints });
+  discovered.set(key, { at: Date.now(), endpoints });
   return endpoints;
 }
 
@@ -260,8 +300,7 @@ export async function refreshChatEndpoint(
   const candidates = chatEndpointCandidates(endpoints, getQoderBaseUrl(mode));
   const preferred = candidates.find((url) => endpoints.remoteAgentNodes.includes(url)) ?? candidates[0];
   if (!preferred) return undefined;
-  setQoderChatBaseUrl(mode, preferred);
-  rememberChatBaseUrl(mode, preferred);
+  rememberChatBaseUrl(mode, credentials, preferred);
   return preferred;
 }
 
@@ -274,16 +313,26 @@ export async function rotateChatEndpoint(
   mode: QoderMode,
   credentials: QoderEndpointCredentials | undefined,
   attempted: Set<string>,
+  currentBase = getQoderBaseUrl(mode),
+  signal?: AbortSignal,
 ): Promise<string | undefined> {
-  const current = normalizeBaseUrl(getQoderChatBaseUrl(mode));
+  signal?.throwIfAborted();
+  const current = normalizeBaseUrl(currentBase);
   if (current) attempted.add(current);
 
-  const endpoints = credentials ? await getRegionEndpoints(mode, credentials) : undefined;
+  const endpoints = credentials ? await getRegionEndpoints(mode, credentials, signal) : undefined;
+  signal?.throwIfAborted();
   const candidates = chatEndpointCandidates(endpoints, getQoderBaseUrl(mode));
   const next = candidates.find((url) => !attempted.has(url));
   if (!next) return undefined;
 
   attempted.add(next);
-  setQoderChatBaseUrl(mode, next);
   return next;
+}
+
+/** Resolve a route for this account without consulting region-wide overrides. */
+export function getAccountChatBaseUrl(mode: QoderMode, credentials: QoderEndpointCredentials): string {
+  return (
+    selected.get(accountKey(mode, credentials)) ?? applyCachedChatEndpoint(mode, credentials) ?? getQoderBaseUrl(mode)
+  );
 }

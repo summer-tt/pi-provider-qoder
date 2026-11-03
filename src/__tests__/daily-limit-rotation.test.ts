@@ -3,22 +3,24 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, AssistantMessageEvent, AssistantMessageEventStream, Context, Model } from "@earendil-works/pi-ai";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
-import { clearQoderEndpointsCache, getCachedChatBaseUrl } from "../endpoints.js";
+import { clearQoderEndpointsCache, getAccountChatBaseUrl, getCachedChatBaseUrl } from "../endpoints.js";
 import { streamQoder } from "../protocol/stream.js";
-import { clearQoderChatBaseUrlOverrides, getQoderChatBaseUrl } from "../region.js";
+import { clearQoderChatBaseUrlOverrides } from "../region.js";
 import { loadLiveFixture } from "./live-fixture.js";
 
 vi.mock("../auth/oauth.js", () => ({
-  resolveQoderIdentity: vi.fn().mockResolvedValue({
+  resolveQoderIdentity: vi.fn().mockImplementation(async (token: string) => ({
     access: "fake",
-    userID: "test-user",
+    userID: token === "fake" ? "test-user" : token,
     email: "test@example.com",
     name: "Test User",
     machineID: "test-machine",
     refresh: "",
     expires: 0,
-  }),
+  })),
 }));
+
+const credentials = { userID: "test-user", authToken: "fake" };
 
 const SUCCESS_SSE = loadLiveFixture("global").interactions.chat.response.body as string;
 
@@ -106,8 +108,8 @@ describe("daily chat limit recovery", () => {
     const chatCalls = calls.filter((url) => url.includes("agent_chat_generation"));
     expect(chatCalls[0]?.startsWith("https://api3.qoder.sh/")).toBe(true);
     expect(chatCalls[1]?.startsWith("https://api2.qoder.sh/")).toBe(true);
-    expect(getQoderChatBaseUrl("global")).toBe("https://api2.qoder.sh/");
-    expect(getCachedChatBaseUrl("global")).toBe("https://api2.qoder.sh/");
+    expect(getAccountChatBaseUrl("global", credentials)).toBe("https://api2.qoder.sh/");
+    expect(getCachedChatBaseUrl("global", credentials)).toBe("https://api2.qoder.sh/");
   });
 
   it("also rotates when the 110 rejection arrives as a plain HTTP error", async () => {
@@ -140,8 +142,8 @@ describe("daily chat limit recovery", () => {
     const chatCalls = calls.filter((url) => url.includes("agent_chat_generation"));
     expect(chatCalls[0]?.startsWith("https://api3.qoder.sh/")).toBe(true);
     expect(chatCalls[1]?.startsWith("https://api2.qoder.sh/")).toBe(true);
-    expect(getQoderChatBaseUrl("global")).toBe("https://api2.qoder.sh/");
-    expect(getCachedChatBaseUrl("global")).toBe("https://api2.qoder.sh/");
+    expect(getAccountChatBaseUrl("global", credentials)).toBe("https://api2.qoder.sh/");
+    expect(getCachedChatBaseUrl("global", credentials)).toBe("https://api2.qoder.sh/");
   });
 
   it("surfaces the rejection when no other node is available", async () => {
@@ -156,5 +158,93 @@ describe("daily chat limit recovery", () => {
     const error = events.find((ev) => ev.type === "error");
     expect(error).toBeDefined();
     expect(JSON.stringify(error)).toContain("110");
+  });
+
+  it("stops after caller abort during discovery following 110", async () => {
+    const controller = new AbortController();
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      if (String(input).includes("region/endpoints")) {
+        controller.abort();
+        return new Promise<Response>(() => {});
+      }
+      return new Response(DAILY_LIMIT_SSE);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const events = await consume(
+      streamQoder(makeModel(), makeContext(), { apiKey: "fake", signal: controller.signal }),
+    );
+    expect(events.at(-1)?.type).toBe("error");
+    expect(JSON.stringify(events.at(-1))).toContain("aborted");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(getCachedChatBaseUrl("global", credentials)).toBeUndefined();
+  });
+
+  it("does not retry 110 after model output", async () => {
+    const content = sseEnvelope({ choices: [{ delta: { content: "visible" } }] });
+    const fetchMock = vi.fn(async () => new Response(content + DAILY_LIMIT_SSE));
+    vi.stubGlobal("fetch", fetchMock);
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    expect(JSON.stringify(events)).toContain("visible");
+    expect(events.at(-1)?.type).toBe("error");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps concurrent accounts' selected and successful nodes separate", async () => {
+    let releaseA!: () => void;
+    let reachedA!: () => void;
+    const waitingA = new Promise<void>((resolve) => {
+      reachedA = resolve;
+    });
+    const pausedA = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    let discoveries = 0;
+    const calls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        calls.push(url);
+        if (url.includes("region/endpoints")) {
+          const node = ++discoveries === 1 ? "a" : "b";
+          return new Response(JSON.stringify({ dataNodeMap: { remote_agent: [`https://${node}.example/`] } }));
+        }
+        if (url.startsWith("https://api3.qoder.sh/")) return new Response(DAILY_LIMIT_SSE);
+        if (url.startsWith("https://a.example/")) {
+          reachedA();
+          await pausedA;
+        }
+        return new Response(SUCCESS_SSE);
+      }),
+    );
+    const a = consume(streamQoder(makeModel(), makeContext(), { apiKey: "account-a" }));
+    await waitingA;
+    const b = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "account-b" }));
+    expect(b.at(-1)?.type).toBe("done");
+    releaseA();
+    expect((await a).at(-1)?.type).toBe("done");
+    expect(discoveries).toBe(2);
+    expect(calls.filter((url) => url.includes("agent_chat_generation"))).toHaveLength(4);
+    expect(getCachedChatBaseUrl("global", { userID: "account-a", authToken: "account-a" })).toBe("https://a.example/");
+    expect(getCachedChatBaseUrl("global", { userID: "account-b", authToken: "account-b" })).toBe("https://b.example/");
+  });
+
+  it("caps endpoint switches at three", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) =>
+      String(input).includes("region/endpoints")
+        ? new Response(
+            JSON.stringify({
+              dataNodeMap: {
+                remote_agent: ["https://a.example/", "https://b.example/", "https://c.example/", "https://d.example/"],
+              },
+            }),
+          )
+        : new Response(DAILY_LIMIT_SSE),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    expect(events.at(-1)?.type).toBe("error");
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(getCachedChatBaseUrl("global", credentials)).toBeUndefined();
   });
 });

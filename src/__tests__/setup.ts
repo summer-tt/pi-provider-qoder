@@ -15,3 +15,8 @@ const home = mkdtempSync(join(tmpdir(), "pi-provider-qoder-test-"));
 process.env.HOME = home;
 process.env.USERPROFILE = home;
 mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+
+// Every network operation must be supplied by the test itself.
+globalThis.fetch = (() => {
+  throw new Error("Unexpected network request in offline tests");
+}) as typeof fetch;

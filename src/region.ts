@@ -93,8 +93,8 @@ export function getQoderModelListURL(mode: QoderMode): string {
   return `${getQoderBaseUrl(mode)}algo/api/v2/model/list?Encode=1`;
 }
 
-export function getQoderChatURL(mode: QoderMode): string {
-  return `${getQoderChatBaseUrl(mode)}algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1`;
+export function getQoderChatURL(mode: QoderMode, baseUrl = getQoderChatBaseUrl(mode)): string {
+  return `${baseUrl}algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1`;
 }
 
 export function getQoderExchangeURL(mode: QoderMode): string {
