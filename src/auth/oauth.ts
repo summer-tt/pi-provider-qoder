@@ -129,13 +129,17 @@ export async function autoLoginQoderFromEnvironment(providerID: string, mode: Qo
  * store. pi persists the full OAuthCredentials there on login/refresh and keeps
  * it up to date, so there is no need to maintain a separate credentials cache.
  *
+ * A nonempty token must match the stored access token. Startup callers pass
+ * an empty token to read the provider's current account.
+ *
  * Note: the auth.json path/shape is a pi internal convention, not a public API.
  * This is best-effort and falls back to null so callers can use placeholders.
  */
-export function getCachedCredentials(_accessToken: string, providerID = "qoder"): QoderCredentials | null {
+export function getCachedCredentials(accessToken: string, providerID = "qoder"): QoderCredentials | null {
   const auth = readAuthFileCached();
   if (!auth) return null;
   const creds = (auth[providerID] || (providerID === "qoder" ? auth.qoder : null)) as QoderCredentials | null;
+  if (accessToken && creds?.access !== accessToken) return null;
   if (creds?.userID || creds?.access) {
     if (creds.access && creds.userID) {
       identityCache.set(`${providerID}:${creds.access}`, creds);
