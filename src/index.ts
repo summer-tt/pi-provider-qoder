@@ -107,13 +107,16 @@ async function refreshModelsAtStartup(mode: QoderMode): Promise<void> {
 export default async function (pi: ExtensionAPI) {
   await registerQoderApi();
 
-  // npm-installed extensions get no update check from the host, so report a
-  // stale install once per start. Never awaited: registration must not wait on
-  // the network, and a failure here is uninteresting.
+  // Fork wiring: this fork ships as a Git install ref, not the npm package, so
+  // the upstream registry probe is off by default — the npm version number says
+  // nothing about a fork install, and the notice would point users at
+  // `pi install npm:pi-provider-qoder`, i.e. the upstream package. Opt back in
+  // with PI_PROVIDER_QODER_UPDATE_CHECK=1. Never awaited: registration must not
+  // wait on the network, and a failure here is uninteresting.
   void checkForUpdate({
     currentVersion: CURRENT_VERSION,
     hostExecutable: process.argv[1],
-    disabled: process.env.PI_PROVIDER_QODER_SKIP_UPDATE_CHECK === "1",
+    disabled: process.env.PI_PROVIDER_QODER_UPDATE_CHECK !== "1",
   }).then((notice) => {
     if (notice) console.error(notice);
   });
