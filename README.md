@@ -2,6 +2,19 @@
 
 A [pi](https://shittycodingagent.ai/) extension that connects pi to Qoder.
 
+> **Fork delivery.** This repository is a fork (`summer-tt/pi-provider-qoder`) and is
+> **not** published to npm. Install it from the fork's `install` ref, which carries the
+> prebuilt `dist/index.js`:
+>
+> ```bash
+> pi install git:github.com/summer-tt/pi-provider-qoder@install
+> ```
+>
+> Re-running the same command reconciles the clone to the current `install` ref and
+> picks up new commits. `pi install npm:pi-provider-qoder` installs the *upstream*
+> package instead, which does not include this fork's fixes; the marketplace catalog in
+> `.omp-plugin/` likewise points at the upstream repository.
+
 ```bash
 pi install npm:pi-provider-qoder
 # or: omp install npm:pi-provider-qoder
@@ -164,20 +177,21 @@ Session accounting regression tests use these samples without making live reques
 
 ## Version notices
 
-npm-installed extensions get no update check from the host, so the extension asks the
-npm registry once at startup and logs a single line when a newer release exists:
-
-```text
-[pi-provider-qoder] 0.6.9 is available (running 0.6.1). Upgrade: omp plugin upgrade pi-provider-qoder
-```
-
-Nothing is installed automatically. The request has a 2s timeout, failures are silent,
-and `PI_PROVIDER_QODER_SKIP_UPDATE_CHECK=1` turns the check off.
+Upstream compares its npm version against the npm registry at startup. **In this fork
+the check is off by default**: the fork ships as a Git install ref, so the npm version
+number does not describe the running install, and the upstream notice would suggest
+`pi install npm:pi-provider-qoder`, which installs the upstream package rather than
+this fork. Nothing is queried and nothing is printed unless you opt in with
+`PI_PROVIDER_QODER_UPDATE_CHECK=1` (2s timeout, failures silent, nothing is installed
+automatically).
 
 ## Marketplace install (automatic updates)
 
-An npm install never self-updates. To let omp keep this extension current, add this
-repository as a marketplace and install from it:
+This section describes the upstream project's delivery, not this fork's: fork installs
+update through the Git install ref (see "Fork delivery" above), and the catalog below
+points at the upstream repository. For the upstream package, an npm install never
+self-updates; to let omp keep it current, add the upstream repository as a marketplace
+and install from it:
 
 ```bash
 omp plugin marketplace add simonsmh/pi-provider-qoder
@@ -190,17 +204,6 @@ Marketplace installs clone a repository and symlink it — they never run a buil
 branch (`.github/workflows/dist-branch.yml`). The catalog at `.omp-plugin/marketplace.json`
 must declare the released version: `npm run release:sync-marketplace` keeps it in step,
 and `prepublishOnly` fails when the two drift.
-## Version notices
-
-npm-installed extensions get no update check from the host, so the extension asks the
-npm registry once at startup and logs a single line when a newer release exists:
-
-```text
-[pi-provider-qoder] 0.6.9 is available (running 0.6.1). Upgrade: omp plugin upgrade pi-provider-qoder
-```
-
-Nothing is installed automatically. The request has a 2s timeout, failures are silent,
-and `PI_PROVIDER_QODER_SKIP_UPDATE_CHECK=1` turns the check off.
 
 ## License
 

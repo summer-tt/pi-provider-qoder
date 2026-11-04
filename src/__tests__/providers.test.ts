@@ -1,5 +1,6 @@
 import type { OAuthCredentials } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { REGISTRY_URL } from "../update-check.js";
 
 const patEnvNames = [
   "QODER_API_KEY",
@@ -229,5 +230,79 @@ describe("startup discovery deadline", () => {
     expect(getAccountChatBaseUrl("global", { userID: "startup-user", authToken: "synthetic-token" })).toBe(
       stage === "success" ? "https://startup.example/" : "https://api3.qoder.sh/",
     );
+  });
+});
+
+describe("fork startup update check", () => {
+  const optIn = "PI_PROVIDER_QODER_UPDATE_CHECK";
+  const optOut = "PI_PROVIDER_QODER_SKIP_UPDATE_CHECK";
+  const saved: Record<string, string | undefined> = {};
+  let consoleError: ReturnType<typeof vi.spyOn>;
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    saved[optIn] = process.env[optIn];
+    saved[optOut] = process.env[optOut];
+    // A tempting registry reply: if the fork wiring ever regresses to the
+    // upstream default, both the request and the notice must fail loudly here.
+    fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).startsWith("https://registry.npmjs.org/")) {
+        return new Response(JSON.stringify({ version: "9.9.9" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      // Catalog/endpoint refreshes are tolerated (they return early on 500).
+      return new Response("{}", { status: 500 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    consoleError.mockRestore();
+  });
+
+  async function settleStartupNotices(): Promise<void> {
+    // The update check is fire-and-forget; drain its microtask chain (and the
+    // mocked fetch resolution) before asserting on its side effects.
+    for (let tick = 0; tick < 2; tick += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  it("does not query the npm registry or print upgrade guidance by default", async () => {
+    delete process.env[optIn];
+    delete process.env[optOut];
+    for (const name of patEnvNames) delete process.env[name];
+
+    const { default: registerProviders } = await import("../index.js");
+    const registerProvider = vi.fn();
+    await registerProviders({ registerProvider, on: vi.fn() } as never);
+    await settleStartupNotices();
+
+    const requestedUrls = fetchMock.mock.calls.map(([input]) => String(input));
+    expect(requestedUrls).not.toContain(REGISTRY_URL);
+    expect(requestedUrls.some((url) => url.includes("registry.npmjs.org"))).toBe(false);
+    expect(consoleError).not.toHaveBeenCalledWith(expect.stringMatching(/pi-provider-qoder\].*is available/));
+    expect(consoleError).not.toHaveBeenCalledWith(expect.stringContaining("pi install npm:pi-provider-qoder"));
+    expect(registerProvider).toHaveBeenCalledTimes(2);
+    expect(registerProvider.mock.calls.map(([providerID]) => providerID)).toEqual(["qoder", "qoder-cn"]);
+  });
+
+  it("runs the upstream check when PI_PROVIDER_QODER_UPDATE_CHECK=1 opts in", async () => {
+    process.env[optIn] = "1";
+    for (const name of patEnvNames) delete process.env[name];
+
+    const { default: registerProviders } = await import("../index.js");
+    const registerProvider = vi.fn();
+    await registerProviders({ registerProvider, on: vi.fn() } as never);
+    await settleStartupNotices();
+
+    expect(fetchMock).toHaveBeenCalledWith(REGISTRY_URL, expect.objectContaining({ signal: expect.anything() }));
+    expect(consoleError).toHaveBeenCalledWith(expect.stringContaining("9.9.9 is available"));
+    expect(registerProvider).toHaveBeenCalledTimes(2);
   });
 });
