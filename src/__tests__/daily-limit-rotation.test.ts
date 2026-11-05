@@ -1,7 +1,15 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Api, AssistantMessageEvent, AssistantMessageEventStream, Context, Model } from "@earendil-works/pi-ai";
+import type {
+  Api,
+  AssistantMessage,
+  AssistantMessageEvent,
+  AssistantMessageEventStream,
+  Context,
+  Model,
+} from "@earendil-works/pi-ai";
+import * as PiAi from "@earendil-works/pi-ai";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { clearQoderEndpointsCache, getAccountChatBaseUrl, getCachedChatBaseUrl } from "../endpoints.js";
 import { streamQoder } from "../protocol/stream.js";
@@ -38,6 +46,44 @@ function sseEnvelope(body: object, statusCodeValue = 200, statusCode = "OK"): st
 }
 
 const DAILY_LIMIT_SSE = sseEnvelope({ code: "110", message: "Billing daily count exceeded" }, 403);
+
+const DONE_SSE =
+  "data:" +
+  JSON.stringify({
+    headers: { "Content-Type": ["application/json"] },
+    body: "[DONE]",
+    statusCodeValue: 200,
+    statusCode: "OK",
+  }) +
+  "\n\n";
+
+/** A well-formed envelope whose inner chunk is cut short (upstream payload lost mid-stream). */
+function sseTruncatedPayload(body: object): string {
+  const envelope = JSON.parse(sseEnvelope(body).slice("data:".length).trim()) as { body: string };
+  return (
+    "data:" +
+    JSON.stringify({ ...envelope, body: envelope.body.slice(0, Math.max(1, envelope.body.length - 12)) }) +
+    "\n\n"
+  );
+}
+
+// 110 on the default node, then the rotated node loses a payload mid-stream:
+// the turn must end retryable and the failed node must NOT be persisted.
+const LOST_PAYLOAD_AFTER_ROTATION_SSE =
+  sseEnvelope({
+    choices: [
+      {
+        delta: {
+          tool_calls: [{ index: 0, id: "call_1", function: { name: "bash", arguments: '{"command":"echo hello ' } }],
+        },
+      },
+    ],
+  }) +
+  sseTruncatedPayload({
+    choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: 'world","i":"run"}' } }] } }],
+  }) +
+  sseEnvelope({ choices: [{ delta: {}, finish_reason: "tool_calls" }] }) +
+  DONE_SSE;
 
 function makeModel(): Model<Api> {
   return { id: "Lite", api: "qoder-api" as Api, provider: "qoder" } as Model<Api>;
@@ -110,6 +156,44 @@ describe("daily chat limit recovery", () => {
     expect(chatCalls[1]?.startsWith("https://api2.qoder.sh/")).toBe(true);
     expect(getAccountChatBaseUrl("global", credentials)).toBe("https://api2.qoder.sh/");
     expect(getCachedChatBaseUrl("global", credentials)).toBe("https://api2.qoder.sh/");
+  });
+
+  it("does not persist the rotated node when its turn ends in a lost-payload retryable error", async () => {
+    const endpointsFixture = JSON.parse(
+      await import("node:fs").then((fs) =>
+        fs.readFileSync(new URL("../__fixtures__/region-endpoints.json", import.meta.url), "utf8"),
+      ),
+    ) as { encoded: string };
+    const calls: string[] = [];
+    globalThis.fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      calls.push(url);
+      if (url.includes("/service/region/endpoints")) {
+        return new Response(endpointsFixture.encoded, { status: 200 });
+      }
+      if (url.startsWith("https://api3.qoder.sh/")) {
+        return new Response(DAILY_LIMIT_SSE, { status: 200 });
+      }
+      if (url.startsWith("https://api2.qoder.sh/")) {
+        return new Response(LOST_PAYLOAD_AFTER_ROTATION_SSE, { status: 200 });
+      }
+      return new Response("unexpected url", { status: 500 });
+    }) as unknown as typeof fetch;
+
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    const err = events.find((ev) => ev.type === "error") as { error: AssistantMessage } | undefined;
+    expect(err, "expected a retryable error event").toBeDefined();
+    expect(err?.error.errorMessage).toMatch(/argument stream was cut off/);
+    expect(PiAi.isRetryableAssistantError(err?.error as AssistantMessage)).toBe(true);
+    expect(events.some((ev) => ev.type === "done")).toBe(false);
+    const chatCalls = calls.filter((url) => url.includes("agent_chat_generation"));
+    expect(chatCalls[0]?.startsWith("https://api3.qoder.sh/")).toBe(true);
+    expect(chatCalls[1]?.startsWith("https://api2.qoder.sh/")).toBe(true);
+    // The rotated node failed the turn: only a node that served a successful
+    // request may be persisted as the account's chat base.
+    expect(getAccountChatBaseUrl("global", credentials)).toBe("https://api3.qoder.sh/");
+    expect(getCachedChatBaseUrl("global", credentials)).toBeUndefined();
   });
 
   it("also rotates when the 110 rejection arrives as a plain HTTP error", async () => {
