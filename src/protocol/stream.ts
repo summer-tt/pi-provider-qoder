@@ -741,6 +741,10 @@ export function streamQoder(
       let chatURL = getQoderChatURL(providerMode, chatBase);
       const attemptedChatBases = new Set<string>();
       let switchedChatEndpoint = false;
+      // Terminal error paths inside runAttempt (lost payload, degenerate DSML
+      // turn) resolve instead of throwing; only a completed `done` attempt may
+      // persist the rotated node, or a node that failed the turn gets cached.
+      let attemptSucceeded = false;
       let chatEndpointSwitches = 0;
       const modelSource = modelConfig.source || "system";
 
@@ -1263,6 +1267,9 @@ export function streamQoder(
         // Otherwise keep whatever finish_reason set upstream (defaults to "stop").
         // Never overwrite a meaningful finish_reason ("length", "content_filter",
         // ...) with "stop".
+        // This attempt produced a completed assistant turn: the only outcome
+        // that may mark the (possibly rotated) node as successfully serving.
+        attemptSucceeded = true;
         stream.push({
           type: "done",
           reason: output.stopReason as Extract<AssistantMessage["stopReason"], "stop" | "length" | "toolUse">,
@@ -1274,9 +1281,9 @@ export function streamQoder(
       for (let attempt = 0; ; attempt++) {
         try {
           await runAttempt();
-          if (switchedChatEndpoint) {
-            // Only persist a node that actually served a request; a node that
-            // failed again during rotation is never written.
+          if (switchedChatEndpoint && attemptSucceeded) {
+            // Only persist a node that actually served a request to completion;
+            // a node whose turn ended in a terminal error is never written.
             rememberChatBaseUrl(providerMode, endpointCredentials, chatBase);
           }
           return;
