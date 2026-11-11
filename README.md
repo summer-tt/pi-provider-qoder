@@ -205,6 +205,27 @@ branch (`.github/workflows/dist-branch.yml`). The catalog at `.omp-plugin/market
 must declare the released version: `npm run release:sync-marketplace` keeps it in step,
 and `prepublishOnly` fails when the two drift.
 
+## Development
+
+Supported hosts are Pi `>=1.4.0 <1.6.0` (1.4.x and 1.5.x); the devDependency
+`@earendil-works` SDK trio is constrained to the same range, and
+`package-lock.json` pins it to the newest tested baseline. CI does not rely on
+that drift alone: the `sdk-matrix` job reinstalls the trio at the pinned
+oldest (1.4.0) and newest (1.5.2) baselines and runs typecheck + tests on
+each. Locally:
+
+```bash
+npm run check       # typecheck (tsc --noEmit)
+npm test            # offline vitest suite, no live Qoder traffic
+npm run test:sdk-matrix   # check + test against Pi SDK 1.4.0 and 1.5.2
+```
+
+The suite drives `streamQoder` through the real SDK modules — provider
+registration via `pi-ai/compat`, message and tool-call event sequences,
+usage/stopReason capture, and error recovery — against recorded SSE fixtures.
+Live provider round-trips (`npm run test:live`) are a separate, opt-in
+recording step and are never part of CI.
+
 ## License
 
 MIT

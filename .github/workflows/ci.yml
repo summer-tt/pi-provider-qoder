@@ -34,3 +34,28 @@ jobs:
 
       - name: Test
         run: npm test
+
+  # The extension is host-agnostic at runtime, but source and tests compile and
+  # run against the devDependency Pi SDK trio (pi-ai / pi-coding-agent / pi-tui,
+  # released in lockstep). Supported hosts are Pi >=1.4.0 <1.6.0: the job pins
+  # the oldest (1.4.0) and newest tested (1.5.2) baselines instead of drifting
+  # with whatever the lock's range resolves on the day. scripts/sdk-matrix.mjs
+  # reinstalls the trio at an exact version (--no-save) and runs check + test.
+  sdk-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pi-sdk: ["1.4.0", "1.5.2"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci --no-audit --no-fund
+
+      - name: Check and test against Pi SDK ${{ matrix.pi-sdk }}
+        run: node scripts/sdk-matrix.mjs ${{ matrix.pi-sdk }}
