@@ -97,6 +97,7 @@ export async function refreshQoderModelsForMode(
         creds.name || region.userNameFallback,
         creds.email || region.userEmailFallback,
         mode,
+        context.signal,
       );
     }
   }

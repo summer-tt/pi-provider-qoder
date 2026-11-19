@@ -248,12 +248,16 @@ async function awaitModelsCacheAfterLogin(
   // Retain the fallback timer so it can be cleared: without this, a refresh
   // that finishes early leaves the 15s timeout scheduled and the Node process
   // cannot exit naturally until it fires.
+  const controller = new AbortController();
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([
-      updateQoderModelsCache(access, userID, name, email, mode),
-      new Promise((resolve) => {
-        timeout = setTimeout(resolve, LOGIN_MODEL_CACHE_TIMEOUT_MS);
+      updateQoderModelsCache(access, userID, name, email, mode, controller.signal),
+      new Promise<void>((resolve) => {
+        timeout = setTimeout(() => {
+          controller.abort();
+          resolve();
+        }, LOGIN_MODEL_CACHE_TIMEOUT_MS);
       }),
     ]);
   } catch {

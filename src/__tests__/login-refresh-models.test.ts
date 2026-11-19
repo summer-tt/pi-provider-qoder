@@ -80,6 +80,51 @@ describe("refreshQoderModelsForMode", () => {
     expect(existsSync(CACHE_PATH)).toBe(true);
   });
 
+  it("keeps the newer catalog when a canceled refresh finishes late", async () => {
+    let markOldStarted!: () => void;
+    const oldStarted = new Promise<void>((resolve) => {
+      markOldStarted = resolve;
+    });
+    let finishOld!: (response: Response) => void;
+    const oldResponse = new Promise<Response>((resolve) => {
+      finishOld = resolve;
+    });
+    const oldController = new AbortController();
+    let requests = 0;
+    let firstSignal: AbortSignal | null | undefined;
+    const catalog = (name: string) =>
+      new Response(JSON.stringify({ chat: [{ key: name.toLowerCase(), enable: true, display_name: name }] }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init?: RequestInit) => {
+        if (String(url).includes("repo.qoder.com")) return new Response("[]");
+        if (++requests === 1) {
+          firstSignal = init?.signal;
+          markOldStarted();
+          return oldResponse;
+        }
+        return catalog("New");
+      }),
+    );
+
+    const old = refreshQoderModelsForMode("global", {
+      ...refreshContext(true, OAUTH_CREDENTIAL),
+      signal: oldController.signal,
+    });
+    await oldStarted;
+    oldController.abort();
+    const latest = await refreshQoderModelsForMode("global", refreshContext(true, OAUTH_CREDENTIAL));
+    expect(latest.map((model) => model.id)).toEqual(["New"]);
+    finishOld(catalog("Old"));
+    await old;
+
+    expect(getCachedModels("global").map((model) => model.id)).toEqual(["New"]);
+    clearQoderModelsMemCache();
+    const offline = await refreshQoderModelsForMode("global", refreshContext(false));
+    expect(offline.map((model) => model.id)).toEqual(["New"]);
+    expect(firstSignal).toBe(oldController.signal);
+  });
+
   it("offline refresh returns the cached list without fetching", async () => {
     writeFileSync(
       CACHE_PATH,

@@ -169,6 +169,7 @@ describe("loginQoderForMode waits for the model cache", () => {
       "Test User",
       "test@example.com",
       "global",
+      expect.any(AbortSignal),
     );
   });
 
@@ -176,13 +177,18 @@ describe("loginQoderForMode waits for the model cache", () => {
     vi.useFakeTimers();
     try {
       process.env.QODER_PERSONAL_ACCESS_TOKEN = "pt-test-123";
-      vi.mocked(updateQoderModelsCache).mockReturnValueOnce(new Promise<void>(() => {}));
+      let catalogSignal: AbortSignal | undefined;
+      vi.mocked(updateQoderModelsCache).mockImplementationOnce((...args) => {
+        catalogSignal = args[5];
+        return new Promise<void>(() => {});
+      });
       const loginPromise = loginQoderForMode({} as OAuthLoginCallbacks, "global");
 
       // Advance past the bounded wait; login must resolve without the fetch.
       await vi.advanceTimersByTimeAsync(16_000);
       const creds = await loginPromise;
       expect(creds.access).toBe("mock-access-token");
+      expect(catalogSignal?.aborted).toBe(true);
     } finally {
       vi.useRealTimers();
     }

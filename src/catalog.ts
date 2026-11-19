@@ -673,6 +673,7 @@ export async function updateQoderModelsCache(
   name: string,
   email: string,
   mode: QoderMode,
+  signal?: AbortSignal,
 ): Promise<void> {
   const modelListURL = getQoderModelListURL(mode);
   try {
@@ -683,6 +684,7 @@ export async function updateQoderModelsCache(
     // The refresh is throttled to once a day and never throws; when it is
     // not due it returns immediately.
     await refreshGatewayCosyVersion();
+    if (signal?.aborted) return;
 
     const headers = buildAuthHeaders(null, modelListURL, {
       userID,
@@ -693,6 +695,7 @@ export async function updateQoderModelsCache(
 
     const response = await fetch(modelListURL, {
       method: "GET",
+      signal,
       headers: {
         Accept: "application/json",
         ...headers,
@@ -753,7 +756,7 @@ export async function updateQoderModelsCache(
       });
     }
 
-    if (newModels.length === 0) return;
+    if (newModels.length === 0 || signal?.aborted) return;
 
     const cacheData = {
       updatedAt: Date.now(),
